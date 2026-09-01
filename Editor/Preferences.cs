@@ -5,6 +5,7 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
     public static class Preferences
     {
         private const string EditorPrefsPrefix = "com.anatawa12.continuous-avatar-uploader.";
+        internal static event System.Action UploadPlatformsChanged;
 
         public static float SleepSeconds
         {
@@ -29,7 +30,9 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
 
         internal static void SetUploadFor(TargetPlatform targetPlatform, bool value)
         {
+            if (UploadFor(targetPlatform) == value) return;
             EditorPrefs.SetBool(EditorPrefsPrefix + "upload-for." + targetPlatform, value);
+            UploadPlatformsChanged?.Invoke();
         }
 
         public static bool RollbackBuildPlatform

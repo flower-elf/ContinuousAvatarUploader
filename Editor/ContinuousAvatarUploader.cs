@@ -1,13 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading;
 using JetBrains.Annotations;
 using UnityEditor;
+using UnityEditor.UIElements;
 using UnityEngine;
+using UnityEngine.UIElements;
 using VRC.Core;
 using VRC.SDK3.Avatars.Components;
 using VRC.SDK3A.Editor;
+using Object = UnityEngine.Object;
 
 namespace Anatawa12.ContinuousAvatarUploader.Editor
 {
@@ -28,11 +30,7 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
 
         // for uploading avatars
 
-        [NonSerialized] private State _guiState;
         [NonSerialized] private AvatarUploadSetting _currentUploadingAvatar;
-        [SerializeField] private Vector2 uploadsScroll;
-        [SerializeField] private Vector2 errorsScroll;
-        [SerializeField] private Vector2 temporaryAvatarsScroll;
         [SerializeField] private List<UploadErrorInfo> uploadErrors = new List<UploadErrorInfo>();
         [SerializeField] private bool dragDropFoldout = false;
 
@@ -40,6 +38,27 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
 
         private SerializedObject _serialized;
         private SerializedProperty _settingsOrGroups;
+
+        // UI Toolkit elements
+        private VisualElement _progressSection;
+        private ProgressBar _platformProgressBar;
+        private ProgressBar _avatarProgressBar;
+        private ObjectField _uploadingAvatarField;
+        private Label _sleepingLabel;
+        private Button _abortButton;
+        private VisualElement _settingsSection;
+        private Foldout _dragDropFoldoutElement;
+        private VisualElement _dropArea;
+        private VisualElement _temporaryAvatarsContainer;
+        private ScrollView _uploadsScroll;
+        private PropertyField _settingsListField;
+        private VisualElement _checkResultsContainer;
+        private Button _startUploadButton;
+        private ScrollView _errorsContainer;
+
+        private double _lastCheckTime;
+        private int _lastErrorCount = -1;
+        private bool _updateRegistered;
 
         [MenuItem("Window/Continuous Avatar Uploader")]
         [MenuItem("Tools/Continuous Avatar Uploader")]
@@ -61,6 +80,9 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
             UploadOrchestrator.OnUploadFinished += OnUploadFinished;
             UploadOrchestrator.OnLoginFailed += OnLoginFailed;
             UploadOrchestrator.OnRandomException += OnRandomException;
+
+            EditorApplication.update += UpdateTick;
+            _updateRegistered = true;
         }
 
         private void OnDisable()
@@ -72,28 +94,30 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
             UploadOrchestrator.OnUploadFinished -= OnUploadFinished;
             UploadOrchestrator.OnLoginFailed -= OnLoginFailed;
             UploadOrchestrator.OnRandomException -= OnRandomException;
+            if (_updateRegistered)
+            {
+                EditorApplication.update -= UpdateTick;
+                _updateRegistered = false;
+            }
             CleanupTempGroupAsset();
         }
 
-        private void OnSdkPanelEnableDisable(object sender, EventArgs e) => Repaint();
+        private void OnSdkPanelEnableDisable(object sender, EventArgs e) => RefreshDynamicSections();
 
         private void OnUploadSingleAvatarStarted(UploaderProgressAsset progress, AvatarUploadSetting avatar)
         {
-            _guiState = State.UploadingAvatar;
             _currentUploadingAvatar = avatar;
-            Repaint();
+            RefreshDynamicSections();
         }
 
         private void OnUploadSingleAvatarFinished(UploaderProgressAsset progress, AvatarUploadSetting avatar)
         {
-            _guiState = State.UploadedAvatar;
             _currentUploadingAvatar = null;
-            Repaint();
+            RefreshDynamicSections();
         }
 
         private void OnUploadFinished(UploaderProgressAsset obj, bool successfully)
         {
-            _guiState = State.Configuring;
             _currentUploadingAvatar = null;
             // if finished unsuccessfully, we should have shown error dialog already
             if (Preferences.ShowDialogWhenUploadFinished && successfully)
@@ -101,190 +125,475 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
 
             CleanupTempGroupAsset();
 
-            Repaint();
+            RefreshDynamicSections();
         }
 
         private void OnLoginFailed(Exception obj)
         {
-            _guiState = State.Configuring;
             _currentUploadingAvatar = null;
             EditorUtility.DisplayDialog("Continuous Avatar Uploader", "Login Failed: " + obj.Message, "OK");
         }
 
         private void OnRandomException(Exception obj)
         {
-            _guiState = State.Configuring;
             _currentUploadingAvatar = null;
             EditorUtility.DisplayDialog("Continuous Avatar Uploader", "An error occurred: " + obj.Message, "OK");
         }
 
-        private void OnGUI()
+        // ===== UI Toolkit =====
+
+        private void CreateGUI()
+        {
+            rootVisualElement.Clear();
+
+            // progress section
+            _progressSection = new VisualElement { name = "progressSection" };
+            _progressSection.Add(new Label("UPLOAD IN PROGRESS"));
+            _platformProgressBar = new ProgressBar { title = "" };
+            _platformProgressBar.style.height = 20;
+            _progressSection.Add(_platformProgressBar);
+            _avatarProgressBar = new ProgressBar { title = "" };
+            _avatarProgressBar.style.height = 20;
+            _progressSection.Add(_avatarProgressBar);
+            _uploadingAvatarField = new ObjectField("Uploading")
+            {
+                objectType = typeof(AvatarUploadSetting),
+                allowSceneObjects = true,
+            };
+            _uploadingAvatarField.AddToClassList("unity-base-field__aligned");
+            _progressSection.Add(_uploadingAvatarField);
+            _sleepingLabel = new Label("Sleeping a little") { style = { display = DisplayStyle.None } };
+            _progressSection.Add(_sleepingLabel);
+            _abortButton = new Button(UploadOrchestrator.CancelUpload) { text = "ABORT UPLOAD" };
+            _progressSection.Add(_abortButton);
+
+            // settings section
+            _settingsSection = new VisualElement { name = "settingsSection" };
+            _settingsSection.style.flexGrow = 1;
+            _settingsSection.Add(CreatePreferencesFields());
+
+            // drag & drop section (space before it, matching EditorGUILayout.Space)
+            _dragDropFoldoutElement = new Foldout
+            {
+                text = "Drag & Drop Upload",
+                value = dragDropFoldout,
+            };
+            _dragDropFoldoutElement.style.marginTop = 6;
+            _dropArea = new VisualElement { name = "dropArea" };
+            _dropArea.style.justifyContent = Justify.Center;
+            _dropArea.Add(new Label("Drag Avatar Prefabs or GameObjects Here")
+            {
+                style =
+                {
+                    unityTextAlign = TextAnchor.MiddleCenter,
+                    flexGrow = 1,
+                }
+            });
+            _dropArea.style.minHeight = 50;
+            _dropArea.style.borderTopWidth = 1;
+            _dropArea.style.borderBottomWidth = 1;
+            _dropArea.style.borderLeftWidth = 1;
+            _dropArea.style.borderRightWidth = 1;
+            _dropArea.style.borderTopColor = new Color(0.5f, 0.5f, 0.5f, 1);
+            _dropArea.style.borderBottomColor = new Color(0.5f, 0.5f, 0.5f, 1);
+            _dropArea.style.borderLeftColor = new Color(0.5f, 0.5f, 0.5f, 1);
+            _dropArea.style.borderRightColor = new Color(0.5f, 0.5f, 0.5f, 1);
+            _dropArea.style.marginTop = 4;
+            _dropArea.style.marginBottom = 4;
+            _dropArea.style.marginLeft = 4;
+            _dropArea.style.marginRight = 4;
+            _dropArea.RegisterCallback<DragUpdatedEvent>(OnDragUpdated);
+            _dropArea.RegisterCallback<DragPerformEvent>(OnDragPerform);
+            _temporaryAvatarsContainer = new VisualElement { name = "temporaryAvatarsContainer" };
+            _dragDropFoldoutElement.Add(_dropArea);
+            _dragDropFoldoutElement.Add(_temporaryAvatarsContainer);
+            _dragDropFoldoutElement.RegisterValueChangedCallback(evt =>
+            {
+                dragDropFoldout = evt.newValue;
+            });
+            _settingsSection.Add(_dragDropFoldoutElement);
+
+            // target platforms (space before, matching EditorGUILayout.Space)
+            _settingsSection.Add(new Label("Target Platforms")
+            {
+                style = { unityFontStyleAndWeight = FontStyle.Bold, marginTop = 6 }
+            });
+            _settingsSection.Add(CreatePlatformToggles(RefreshCheckSection));
+
+            // check results
+            _checkResultsContainer = new VisualElement { name = "checkResultsContainer" };
+            _settingsSection.Add(_checkResultsContainer);
+
+            _startUploadButton = new Button(StartUploadWithCheck) { text = "Start Upload" };
+            _startUploadButton.style.marginTop = 4;
+            _settingsSection.Add(_startUploadButton);
+
+            // upload settings list
+            _uploadsScroll = new ScrollView { name = "uploadsScroll", verticalScrollerVisibility = ScrollerVisibility.Auto };
+            _uploadsScroll.style.flexGrow = 1;
+            _settingsListField = new PropertyField(_settingsOrGroups) { name = "settingsList" };
+            _uploadsScroll.Add(_settingsListField);
+            var clearSettingsButton = new Button(ClearSettings) { text = "Clear Settings" };
+            _uploadsScroll.Add(clearSettingsButton);
+            _settingsSection.Add(_uploadsScroll);
+
+            // order matters: progress, then settings (both disabled during upload), then errors at the bottom
+            rootVisualElement.Add(_progressSection);
+            rootVisualElement.Add(_settingsSection);
+
+            var errorsLabel = new Label("Errors from Previous Build:")
+            {
+                style = { unityFontStyleAndWeight = FontStyle.Bold, marginTop = 10 }
+            };
+            rootVisualElement.Add(errorsLabel);
+            _errorsContainer = new ScrollView { name = "errorsContainer", verticalScrollerVisibility = ScrollerVisibility.Auto };
+            _errorsContainer.style.flexGrow = 1;
+            rootVisualElement.Add(_errorsContainer);
+
+            _settingsListField.Bind(_serialized);
+
+            RefreshDynamicSections();
+        }
+
+        private VisualElement CreatePreferencesFields()
+        {
+            var container = new VisualElement();
+
+            var sleepField = new FloatField("Sleep Seconds")
+            {
+                tooltip = "The time sleeps between upload",
+                value = Preferences.SleepSeconds,
+            };
+            sleepField.AddToClassList("unity-base-field__aligned");
+            sleepField.style.marginBottom = 2;
+            sleepField.RegisterValueChangedCallback(evt => Preferences.SleepSeconds = evt.newValue);
+            container.Add(sleepField);
+
+            container.Add(CreatePreferenceToggle(
+                "Take Thumbnail In PlayMode by Default",
+                "If this is enabled, CAU will take Thumbnail after entering PlayMode.",
+                Preferences.TakeThumbnailInPlaymodeByDefault,
+                value => Preferences.TakeThumbnailInPlaymodeByDefault = value));
+            container.Add(CreatePreferenceToggle(
+                "Show Dialog when Finished",
+                "If this is enabled, CAU will tell you upload finished.",
+                Preferences.ShowDialogWhenUploadFinished,
+                value => Preferences.ShowDialogWhenUploadFinished = value));
+            container.Add(CreatePreferenceToggle(
+                "Rollback Build Platform",
+                "If this is enabled, CAU will rollback the build platform to the one before upload after upload finished.",
+                Preferences.RollbackBuildPlatform,
+                value => Preferences.RollbackBuildPlatform = value));
+            container.Add(CreatePreferenceToggle(
+                "Continue upload other avatars on build or upload error",
+                "If this is enabled, CAU will continue uploading other avatars even if some avatar build or upload (if reach retry count limit) fails.",
+                Preferences.ContinueUploadOnError,
+                value => Preferences.ContinueUploadOnError = value));
+
+            var retryField = new IntegerField("Retry Count")
+            {
+                tooltip = "The number of retries to attempt for each upload. Zero means no retries, so only one attempt will be made.",
+                value = Preferences.RetryCount,
+            };
+            retryField.AddToClassList("unity-base-field__aligned");
+            retryField.style.marginBottom = 2;
+            retryField.RegisterValueChangedCallback(evt => Preferences.RetryCount = evt.newValue);
+            container.Add(retryField);
+
+            return container;
+        }
+
+        private static Toggle CreatePreferenceToggle(string label, string tooltip, bool initialValue, Action<bool> setter)
+        {
+            var toggle = new Toggle(label)
+            {
+                tooltip = tooltip,
+                value = initialValue,
+            };
+            toggle.style.marginBottom = 2;
+            MakeCheckboxLeft(toggle);
+            toggle.RegisterValueChangedCallback(evt => setter(evt.newValue));
+            return toggle;
+        }
+
+        /// <summary>
+        /// Arranges a toggle as "checkbox on the left, label right after it":
+        /// reorders BaseField's [labelElement, visualInput] so the checkbox
+        /// comes first, and prevents the input from stretching so the label
+        /// hugs the checkbox instead of being pushed to the far right.
+        /// </summary>
+        internal static void MakeCheckboxLeft(Toggle toggle)
+        {
+            var children = toggle.Children().ToArray();
+            if (children.Length < 2) return;
+            var input = children[1];
+            toggle.Remove(input);
+            toggle.Insert(0, input);
+            input.style.flexGrow = 0;
+        }
+
+        private void ClearSettings()
+        {
+            _settingsOrGroups.arraySize = 0;
+            _serialized.ApplyModifiedProperties();
+            _settingsListField.Bind(_serialized);
+            RefreshCheckSection();
+        }
+
+        private void UpdateTick()
         {
             var loaded = UploaderProgressAsset.Load();
             progressAsset = loaded != null ? loaded : progressAsset;
-            progressAsset = progressAsset == null ? null : progressAsset;
-            uploadErrors = progressAsset?.uploadErrors ?? uploadErrors;
-            var uploadInProgress = progressAsset != null;
-            if (uploadInProgress)
+
+            var errorCount = progressAsset?.uploadErrors.Count ?? 0;
+            if (errorCount != _lastErrorCount)
             {
-                var totalCount = progressAsset.uploadSettings.Length;
-                var uploadingIndex = progressAsset.uploadingAvatarIndex;
-                var totalPlatforms = progressAsset.targetPlatforms.Length;
-                var uploadingTargetCount = progressAsset.uploadFinishedPlatforms.Length;
-                GUILayout.Label("UPLOAD IN PROGRESS");
-                EditorGUI.ProgressBar(GUILayoutUtility.GetRect(100, 20),
-                    (uploadingTargetCount + 0.5f) / totalPlatforms,
-                    $"Uploading for {progressAsset.uploadingTargetPlatform} ({uploadingTargetCount + 1} / {totalPlatforms} platforms)");
-                EditorGUI.ProgressBar(GUILayoutUtility.GetRect(100, 20),
-                    (uploadingIndex + 0.5f) / totalCount,
-                    $"Uploading {uploadingIndex + 1} / {totalCount} for {progressAsset.uploadingTargetPlatform}");
-                if (_currentUploadingAvatar)
+                _lastErrorCount = errorCount;
+                uploadErrors = progressAsset?.uploadErrors ?? uploadErrors;
+                RebuildErrorsSection();
+            }
+
+            if (EditorApplication.timeSinceStartup - _lastCheckTime > 0.25)
+            {
+                _lastCheckTime = EditorApplication.timeSinceStartup;
+                RefreshCheckSection();
+            }
+        }
+
+        private void RefreshDynamicSections()
+        {
+            RefreshProgressSection();
+            RebuildErrorsSection();
+            RefreshCheckSection();
+            RebuildTemporaryAvatars();
+        }
+
+        private void RefreshProgressSection()
+        {
+            var uploadInProgress = progressAsset != null;
+            _progressSection.style.display = uploadInProgress ? DisplayStyle.Flex : DisplayStyle.None;
+            _settingsSection.SetEnabled(!uploadInProgress);
+
+            if (!uploadInProgress) return;
+
+            var totalCount = progressAsset.uploadSettings.Length;
+            var uploadingIndex = progressAsset.uploadingAvatarIndex;
+            var totalPlatforms = progressAsset.targetPlatforms.Length;
+            var uploadingTargetCount = progressAsset.uploadFinishedPlatforms.Length;
+
+            _platformProgressBar.value = totalPlatforms == 0 ? 0 : (uploadingTargetCount + 0.5f) / totalPlatforms * 100f;
+            _platformProgressBar.title =
+                $"Uploading for {progressAsset.uploadingTargetPlatform} ({uploadingTargetCount + 1} / {totalPlatforms} platforms)";
+            _avatarProgressBar.value = totalCount == 0 ? 0 : (uploadingIndex + 0.5f) / totalCount * 100f;
+            _avatarProgressBar.title =
+                $"Uploading {uploadingIndex + 1} / {totalCount} for {progressAsset.uploadingTargetPlatform}";
+
+            if (_currentUploadingAvatar)
+            {
+                _uploadingAvatarField.style.display = DisplayStyle.Flex;
+                _sleepingLabel.style.display = DisplayStyle.None;
+                _uploadingAvatarField.value = _currentUploadingAvatar;
+            }
+            else
+            {
+                _uploadingAvatarField.style.display = DisplayStyle.None;
+                _sleepingLabel.style.display = DisplayStyle.Flex;
+            }
+        }
+
+        private void RefreshCheckSection()
+        {
+            if (_checkResultsContainer == null) return;
+            _checkResultsContainer.Clear();
+            var checkResult = CheckUpload();
+            AddCheckHelpBox(checkResult, UploadCheckResult.Uploading, "Uploading", MessageType.Info);
+            AddCheckHelpBox(checkResult, UploadCheckResult.NoDescriptors, "No AvatarUploadSettings are specified", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.AnyNull, "Some AvatarUploadSetting or Group are None", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.PlayMode, "To upload avatars, exit Play mode", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.NoCredentials, "Please login in control panel", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.ControlPanelClosed, "Please open Control panel", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.NoAvatarBuilder, "No Valid VRCSDK Avatars Found", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.PlayModeSettingsNotGood,
+                "Some avatars are going or taking thumbnail in PlayMode. " +
+                "To take thumbnail in PlayMode, Please Disable 'Reload Domain' Option in " +
+                "Enter Play Mode Settings in Editor in Project Settings", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.UnsupportedPlatformSelected,
+                "Some target platforms are selected, but not supported by current build. " +
+                "Please install the build support for those platforms in Unity Hub, or " +
+                "uncheck the target platforms in Continuous Avatar Uploader settings.", MessageType.Error);
+            AddCheckHelpBox(checkResult, UploadCheckResult.NoPlatformsSelected,
+                "No target platforms are selected. " +
+                "Please select at least one target platform in Continuous Avatar Uploader settings.", MessageType.Error);
+            _startUploadButton.SetEnabled(checkResult == UploadCheckResult.Ok);
+        }
+
+        private void AddCheckHelpBox(UploadCheckResult checkResult, UploadCheckResult flag, string text, MessageType messageType)
+        {
+            if ((checkResult & flag) != 0)
+                _checkResultsContainer.Add(new HelpBox(text, (HelpBoxMessageType)messageType));
+        }
+
+        private void RebuildErrorsSection()
+        {
+            if (_errorsContainer == null) return;
+            _errorsContainer.Clear();
+            if (uploadErrors.Count == 0)
+            {
+                _errorsContainer.Add(new Label("No Errors"));
+                return;
+            }
+
+            foreach (var previousUploadError in uploadErrors)
+            {
+                var row = new VisualElement();
+                if (previousUploadError.uploadingAvatar != null)
                 {
-                    EditorGUILayout.ObjectField("Uploading", _currentUploadingAvatar, typeof(AvatarUploadSetting), true);
+                    var uploadingField = new ObjectField("Uploading")
+                    {
+                        objectType = typeof(AvatarUploadSetting),
+                        value = previousUploadError.uploadingAvatar,
+                        allowSceneObjects = false,
+                    };
+                    uploadingField.AddToClassList("unity-base-field__aligned");
+                    row.Add(uploadingField);
+                }
+                else if (previousUploadError.avatarDescriptor.asset != null
+                         && previousUploadError.avatarDescriptor.GetCachedResolve() is VRCAvatarDescriptor descriptor)
+                {
+                    var uploadingField = new ObjectField("Uploading")
+                    {
+                        objectType = typeof(VRCAvatarDescriptor),
+                        value = descriptor,
+                        allowSceneObjects = false,
+                    };
+                    uploadingField.AddToClassList("unity-base-field__aligned");
+                    row.Add(uploadingField);
                 }
                 else
                 {
-                    GUILayout.Label("Sleeping a little");
+                    row.Add(CreateLabelField("Avatar", previousUploadError.avatarName));
                 }
 
-                if (GUILayout.Button("ABORT UPLOAD"))
-                    UploadOrchestrator.CancelUpload();
+                var platformField = new EnumField("For", previousUploadError.targetPlatform);
+                platformField.AddToClassList("unity-base-field__aligned");
+                row.Add(platformField);
+                row.Add(new TextField { value = previousUploadError.message, multiline = true });
+                _errorsContainer.Add(row);
+            }
+        }
+
+        private static VisualElement CreateLabelField(string label, string value)
+        {
+            var row = new VisualElement { style = { flexDirection = FlexDirection.Row } };
+            row.AddToClassList("unity-base-field");
+            row.AddToClassList("unity-base-field__aligned");
+            var labelElement = new Label(label);
+            labelElement.AddToClassList("unity-base-field__label");
+            row.Add(labelElement);
+            var valueElement = new Label(value);
+            valueElement.AddToClassList("unity-base-field__input");
+            valueElement.style.flexGrow = 1;
+            row.Add(valueElement);
+            return row;
+        }
+
+        private void RebuildTemporaryAvatars()
+        {
+            if (_temporaryAvatarsContainer == null) return;
+            _temporaryAvatarsContainer.Clear();
+
+            if (temporarySettings.Count == 0)
+            {
+                _dropArea.style.display = DisplayStyle.Flex;
+                return;
             }
 
-            EditorGUI.BeginDisabledGroup(uploadInProgress);
-            _serialized.Update();
-            Preferences.SleepSeconds = EditorGUILayout.FloatField(
-                new GUIContent("Sleep Seconds", "The time sleeps between upload"),
-                Preferences.SleepSeconds);
-            Preferences.TakeThumbnailInPlaymodeByDefault = EditorGUILayout.ToggleLeft(
-                new GUIContent("Take Thumbnail In PlayMode by Default", 
-                    "If this is enabled, CAU will take Thumbnail after entering PlayMode."),
-                Preferences.TakeThumbnailInPlaymodeByDefault);
-            Preferences.ShowDialogWhenUploadFinished = EditorGUILayout.ToggleLeft(
-                new GUIContent("Show Dialog when Finished", 
-                    "If this is enabled, CAU will tell you upload finished."),
-                Preferences.ShowDialogWhenUploadFinished);
-            Preferences.RollbackBuildPlatform = EditorGUILayout.ToggleLeft(
-                new GUIContent("Rollback Build Platform", 
-                    "If this is enabled, CAU will rollback the build platform to the one before upload after upload finished."),
-                Preferences.RollbackBuildPlatform);
-            Preferences.ContinueUploadOnError = EditorGUILayout.ToggleLeft(
-                new GUIContent("Continue upload other avatars on build or upload error",
-                    "If this is enabled, CAU will continue uploading other avatars even if some avatar build or upload (if reach retry count limit) fails."),
-                Preferences.ContinueUploadOnError);
-            Preferences.RetryCount = EditorGUILayout.IntField(
-                new GUIContent("Retry Count", "The number of retries to attempt for each upload. Zero means no retries, so only one attempt will be made."),
-                Preferences.RetryCount);
+            _temporaryAvatarsContainer.Add(new Label("Avatar List:"));
+            var avatarRows = new VisualElement { name = "temporaryAvatarRows" };
 
-            EditorGUILayout.Space();
-            dragDropFoldout = EditorGUILayout.Foldout(dragDropFoldout, new GUIContent("Drag & Drop Upload"), true, EditorStyles.foldoutHeader);
-            if (dragDropFoldout)
+            for (int i = temporarySettings.Count - 1; i >= 0; i--)
             {
-                EditorGUI.indentLevel++;
-
-                EditorGUILayout.Space();
-                HandleDragAndDrop();
-
-                if (temporarySettings.Count > 0)
+                var index = i;
+                var maySceneRef = temporarySettings[i];
+                if (maySceneRef.asset == null)
                 {
-                    EditorGUILayout.Space();
-                    DrawTemporaryAvatarList();
+                    temporarySettings.RemoveAt(i);
+                    continue;
                 }
-                EditorGUI.indentLevel--;
-            }
-            EditorGUILayout.Space();
 
-            EditorGUILayout.LabelField("Target Platforms", EditorStyles.boldLabel);
-            foreach (var platform in Uploader.GetTargetPlatforms())
-            {
-                var isEnabled = Preferences.UploadFor(platform);
-                var supported = Uploader.IsBuildSupportedInstalled(platform);
-                EditorGUI.BeginDisabledGroup(!supported && !isEnabled);
-                isEnabled = EditorGUILayout.ToggleLeft(
-                    new GUIContent($"Upload for {platform}", 
-                        supported ? $"If this is enabled, CAU will upload avatars for {platform} platform."
-                            : $"Build support for {platform} is not installed. "),
-                    isEnabled);
-                EditorGUI.EndDisabledGroup();
-                Preferences.SetUploadFor(platform, isEnabled);
-            }
+                var descriptor = maySceneRef.GetCachedResolve() as VRCAvatarDescriptor;
+                var avatarName = descriptor?.gameObject.name ?? "Missing Avatar";
 
-            var checkResult = CheckUpload();
-            if ((checkResult & UploadCheckResult.Uploading) != 0)
-                EditorGUILayout.HelpBox("Uploading", MessageType.Info);
-            if ((checkResult & UploadCheckResult.NoDescriptors) != 0)
-                EditorGUILayout.HelpBox("No AvatarUploadSettings are specified", MessageType.Error);
-            if ((checkResult & UploadCheckResult.AnyNull) != 0)
-                EditorGUILayout.HelpBox("Some AvatarUploadSetting or Group are None", MessageType.Error);
-            if ((checkResult & UploadCheckResult.PlayMode) != 0)
-                EditorGUILayout.HelpBox("To upload avatars, exit Play mode", MessageType.Error);
-            if ((checkResult & UploadCheckResult.NoCredentials) != 0)
-                EditorGUILayout.HelpBox("Please login in control panel", MessageType.Error);
-            if ((checkResult & UploadCheckResult.ControlPanelClosed) != 0)
-                EditorGUILayout.HelpBox("Please open Control panel", MessageType.Error);
-            if ((checkResult & UploadCheckResult.NoAvatarBuilder) != 0)
-                EditorGUILayout.HelpBox("No Valid VRCSDK Avatars Found", MessageType.Error);
-            if ((checkResult & UploadCheckResult.PlayModeSettingsNotGood) != 0)
-                EditorGUILayout.HelpBox(
-                    "Some avatars are going or taking thumbnail in PlayMode. " +
-                    "To take thumbnail in PlayMode, Please Disable 'Reload Domain' Option in " +
-                    "Enter Play Mode Settings in Editor in Project Settings",
-                    MessageType.Error);
-            if ((checkResult & UploadCheckResult.UnsupportedPlatformSelected) != 0)
-                EditorGUILayout.HelpBox(
-                    "Some target platforms are selected, but not supported by current build. " +
-                    "Please install the build support for those platforms in Unity Hub, or " +
-                    "uncheck the target platforms in Continuous Avatar Uploader settings.",
-                    MessageType.Error);
-            if ((checkResult & UploadCheckResult.NoPlatformsSelected) != 0)
-                EditorGUILayout.HelpBox(
-                    "No target platforms are selected. " +
-                    "Please select at least one target platform in Continuous Avatar Uploader settings.",
-                    MessageType.Error);
-            using (new EditorGUI.DisabledScope(checkResult != UploadCheckResult.Ok))
-            {
-                if (GUILayout.Button("Start Upload"))
+                var row = new VisualElement { style = { flexDirection = FlexDirection.Row } };
+                var objectField = new ObjectField(avatarName)
                 {
-                    DoStartUpload();
-                }
+                    objectType = typeof(VRCAvatarDescriptor),
+                    value = descriptor,
+                    allowSceneObjects = true,
+                };
+                objectField.AddToClassList("unity-base-field__aligned");
+                objectField.style.flexGrow = 1;
+                objectField.RegisterValueChangedCallback(evt =>
+                {
+                    if (evt.newValue is VRCAvatarDescriptor newDescriptor)
+                        temporarySettings[index] = new MaySceneReference(newDescriptor);
+                });
+                var removeButton = new Button(() =>
+                {
+                    temporarySettings.RemoveAt(index);
+                    RebuildTemporaryAvatars();
+                }) { text = "Remove" };
+                removeButton.style.width = 60;
+                row.Add(objectField);
+                row.Add(removeButton);
+                avatarRows.Add(row);
             }
 
-            uploadsScroll = EditorGUILayout.BeginScrollView(uploadsScroll);
-            EditorGUILayout.PropertyField(_settingsOrGroups);
-            if (GUI.Button(EditorGUI.IndentedRect(EditorGUILayout.GetControlRect()), "Clear Settings"))
-                _settingsOrGroups.arraySize = 0;
-            _serialized.ApplyModifiedProperties();
-            EditorGUILayout.EndScrollView();
-
-            EditorGUI.EndDisabledGroup();
-
-            EditorGUILayout.Space();
-            GUILayout.Label("Errors from Previous Build:", EditorStyles.boldLabel);
-            errorsScroll = EditorGUILayout.BeginScrollView(errorsScroll);
-            if (uploadErrors.Count == 0) GUILayout.Label("No Errors");
+            if (temporarySettings.Count > 8)
+            {
+                var scroll = new ScrollView { name = "temporaryAvatarsScroll" };
+                scroll.style.maxHeight = 160;
+                scroll.Add(avatarRows);
+                _temporaryAvatarsContainer.Add(scroll);
+            }
             else
             {
-                foreach (var previousUploadError in uploadErrors)
-                {
-                    if (previousUploadError.uploadingAvatar != null)
-                    {
-                        EditorGUILayout.ObjectField("Uploading", previousUploadError.uploadingAvatar,
-                            typeof(AvatarUploadSetting), false);
-                    }
-                    else if (previousUploadError.avatarDescriptor.asset != null
-                                && previousUploadError.avatarDescriptor.GetCachedResolve() is VRCAvatarDescriptor descriptor)
-                    {
-                        EditorGUILayout.ObjectField("Uploading", descriptor, typeof(VRCAvatarDescriptor), false);
-                    }
-                    else
-                    {
-                        EditorGUILayout.LabelField("Avatar", previousUploadError.avatarName);
-                    }
-                    EditorGUILayout.EnumPopup("For", previousUploadError.targetPlatform);
-                    EditorGUILayout.TextArea(previousUploadError.message);
-                }
+                _temporaryAvatarsContainer.Add(avatarRows);
             }
-            EditorGUILayout.EndScrollView();
+
+            var clearAllButton = new Button(() =>
+            {
+                temporarySettings.Clear();
+                RebuildTemporaryAvatars();
+            }) { text = "Clear All D&D Avatars" };
+            _temporaryAvatarsContainer.Add(clearAllButton);
+        }
+
+        private void OnDragUpdated(DragUpdatedEvent evt)
+        {
+            DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            evt.StopPropagation();
+        }
+
+        private void OnDragPerform(DragPerformEvent evt)
+        {
+            DragAndDrop.AcceptDrag();
+
+            foreach (var draggedObject in DragAndDrop.objectReferences)
+            {
+                if (!(draggedObject is GameObject go))
+                    continue;
+
+                var descriptor = go.GetComponent<VRCAvatarDescriptor>();
+                if (descriptor == null)
+                    continue;
+
+                var maySceneRef = new MaySceneReference(descriptor);
+                temporarySettings.Add(maySceneRef);
+            }
+
+            RebuildTemporaryAvatars();
+            evt.StopPropagation();
         }
 
         [Flags]
@@ -304,9 +613,9 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
         }
 
         // We do omit temp since play mode settings is always default
-        private UploadCheckResult CheckUpload() => CheckUploadStatic(GetUploadingAvatars(includeTemp: false), Repaint);
+        private UploadCheckResult CheckUpload() => CheckUploadStatic(GetUploadingAvatars(includeTemp: false), RefreshDynamicSections);
 
-        private static UploadCheckResult CheckUploadStatic(IEnumerable<AvatarUploadSetting> avatars, [CanBeNull] Action repaint = null)
+        internal static UploadCheckResult CheckUploadStatic(IEnumerable<AvatarUploadSetting> avatars, [CanBeNull] Action repaint = null)
         {
             var result = UploadCheckResult.Ok;
             if (UploadOrchestrator.IsUploadInProgress()) result |= UploadCheckResult.Uploading;
@@ -333,6 +642,51 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
             if (CheckUpload() != UploadCheckResult.Ok) return false;
             DoStartUpload();
             return true;
+        }
+
+        private void StartUploadWithCheck()
+        {
+            if (!StartUpload())
+                ShowUploadFailedDialog();
+        }
+
+        private static void ShowUploadFailedDialog()
+        {
+            EditorUtility.DisplayDialog("Failed to start upload",
+                "Failed to start upload.\nPlease refer Uploader window for reason", "OK");
+        }
+
+        /// <summary>
+        /// Creates a row of toggles for the target platforms, shared by the main window
+        /// and the inspector upload buttons.
+        /// </summary>
+        internal static VisualElement CreatePlatformToggles(Action onChange)
+        {
+            var container = new VisualElement { name = "platformsRow" };
+            foreach (var platform in Uploader.GetTargetPlatforms())
+            {
+                var platformName = platform;
+                var isEnabled = Preferences.UploadFor(platform);
+                var supported = Uploader.IsBuildSupportedInstalled(platform);
+                var toggle = new Toggle($"Upload for {platformName}")
+                {
+                    value = isEnabled,
+                    tooltip = supported
+                        ? $"If this is enabled, CAU will upload avatars for {platformName} platform."
+                        : $"Build support for {platformName} is not installed. ",
+                };
+                toggle.style.marginBottom = 2;
+                MakeCheckboxLeft(toggle);
+                toggle.SetEnabled(supported || isEnabled);
+                toggle.RegisterValueChangedCallback(evt =>
+                {
+                    Preferences.SetUploadFor(platformName, evt.newValue);
+                    onChange?.Invoke();
+                });
+                container.Add(toggle);
+            }
+
+            return container;
         }
 
         private static bool CheckPlaymodeSettings(IEnumerable<AvatarUploadSetting> avatars)
@@ -403,7 +757,6 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
 
         private void DoStartUpload()
         {
-
             var progress = ScriptableObject.CreateInstance<UploaderProgressAsset>();
             progress.openedScenes = UploadOrchestrator.GetLastOpenedScenes();
             progress.uploadSettings = GetUploadingAvatars().ToArray();
@@ -413,127 +766,6 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
             progress.retryCount = Preferences.RetryCount;
             progress.continueUploadOnError = Preferences.ContinueUploadOnError;
             UploadOrchestrator.StartUpload(progress);
-        }
-
-        enum State
-        {
-            Configuring,
-
-            // upload avatar process
-            UploadingAvatar,
-            UploadedAvatar,
-        }
-
-        static class UploadButtonGuiStyles
-        {
-            public static GUIContent label = new("Upload This Avatar",
-                "Upload this avatar to the current target platform. " +
-                "If you want to upload multiple avatars, use the Continuous Avatar Uploader window.");
-        }
-
-        public static void UploadButtonGui(IEnumerable<AvatarUploadSettingOrGroup> avatarOrGroups, [CanBeNull] Action repaint = null)
-        {
-            var avatars = avatarOrGroups
-                .Where(x => x)
-                .SelectMany(x => x.Settings)
-                .Where(x => x)
-                .ToArray();
-            var check = CheckUploadStatic(avatars, repaint);
-
-            // target platform selector
-            var flags = FlagsForCurrentBuildPlatforms();
-            EditorGUI.BeginChangeCheck();
-            flags = (TargetPlatformFlags)EditorGUILayout.EnumFlagsField("Target Platforms", flags);
-            if (EditorGUI.EndChangeCheck()) SetBuildPlatforms(flags);
-
-            EditorGUI.BeginDisabledGroup(check != UploadCheckResult.Ok);
-            var guiContent = UploadButtonGuiStyles.label;
-            guiContent.text = avatars.Length == 1 ? "Upload This Avatar" : $"Upload {avatars.Length} Avatars";
-            guiContent.tooltip = check == UploadCheckResult.Ok ? "" : "Cannot upload avatars now. Check the Continuous Avatar Uploader window for details.";
-            if (GUILayout.Button(guiContent))
-            {
-                var uploader = OpenWindow();
-                uploader.settingsOrGroups = avatars.ToArray<AvatarUploadSettingOrGroup>();
-                if (!uploader.StartUpload())
-                {
-                    EditorUtility.DisplayDialog("Failed to start upload",
-                        "Failed to start upload.\nPlease refer Uploader window for reason", "OK");
-                }
-            }
-            EditorGUI.EndDisabledGroup();
-        }
-
-        private static TargetPlatformFlags FlagsForCurrentBuildPlatforms()
-        {
-            TargetPlatformFlags flags = 0;
-            foreach (var platform in Uploader.GetTargetPlatforms())
-            {
-                if (Preferences.UploadFor(platform))
-                {
-                    flags |= (TargetPlatformFlags)(1 << (int)platform);
-                }
-            }
-            return flags;
-        }
-
-        private static void SetBuildPlatforms(TargetPlatformFlags flags)
-        {
-            foreach (var platform in Uploader.GetTargetPlatforms())
-            {
-                var flag = (TargetPlatformFlags)(1 << (int)platform);
-                Preferences.SetUploadFor(platform, (flags & flag) != 0);
-            }
-        }
-
-        [Flags]
-        enum TargetPlatformFlags
-        {
-            Windows = 1 << (int)TargetPlatform.Windows,
-            Android = 1 << (int)TargetPlatform.Android,
-            iOS = 1 << (int)TargetPlatform.iOS,
-        }
-
-
-        private void HandleDragAndDrop()
-        {
-            var dropArea = GUILayoutUtility.GetRect(0.0f, 50.0f, GUILayout.ExpandWidth(true));
-            var style = new GUIStyle(GUI.skin.box);
-            style.alignment = TextAnchor.MiddleCenter;
-            style.normal.textColor = EditorGUIUtility.isProSkin ? new Color(0.7f, 0.7f, 0.7f) : new Color(0.3f, 0.3f, 0.3f);
-            GUI.Box(dropArea, "Drag Avatar Prefabs or GameObjects Here", style);
-
-            var currentEvent = Event.current;
-
-            switch (currentEvent.type)
-            {
-                case EventType.DragUpdated:
-                case EventType.DragPerform:
-                    if (!dropArea.Contains(currentEvent.mousePosition))
-                        return;
-
-                    DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
-
-                    if (currentEvent.type != EventType.DragPerform)
-                        break;
-
-                    DragAndDrop.AcceptDrag();
-
-                    foreach (var draggedObject in DragAndDrop.objectReferences)
-                    {
-                        if (!(draggedObject is GameObject go))
-                            continue;
-
-                        var descriptor = go.GetComponent<VRCAvatarDescriptor>();
-                        if (descriptor == null)
-                            continue;
-
-                        var maySceneRef = new MaySceneReference(descriptor);
-                        temporarySettings.Add(maySceneRef);
-                    }
-                    currentEvent.Use();
-                    Repaint();
-                    break;
-            }
         }
 
         private AvatarUploadSetting CreateTemporarySetting(MaySceneReference maySceneRef)
@@ -555,58 +787,206 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
             return tempSetting;
         }
 
-
-        private void DrawTemporaryAvatarList()
+        /// <summary>
+        /// Creates a UI Toolkit element for uploading the given avatars directly from an inspector.
+        /// </summary>
+        public static VisualElement UploadButtonGui(IEnumerable<AvatarUploadSettingOrGroup> avatarOrGroups, [CanBeNull] Action repaint = null)
         {
-            EditorGUILayout.LabelField("Avatar List:");
+            var avatars = avatarOrGroups
+                .Where(x => x)
+                .SelectMany(x => x.Settings)
+                .Where(x => x)
+                .ToArray();
 
-            const float itemHeight = 20f;
-            const int maxVisibleItems = 8;
+            var root = new VisualElement { name = "UploadButtonGui" };
 
-            if (temporarySettings.Count > maxVisibleItems)
+            Button uploadButton = null!;
+
+            // target platform selector: a pure UI Toolkit multi-select dropdown
+            // (equivalent of the original EnumFlagsField)
+            var platformField = new EnumFlagsDropdownField("Target Platforms",
+                Uploader.GetTargetPlatforms().ToArray(),
+                platform => Preferences.UploadFor(platform),
+                (platform, value) => Preferences.SetUploadFor(platform, value));
+            platformField.RegisterValueChangedCallback(_ =>
             {
-                temporaryAvatarsScroll = EditorGUILayout.BeginScrollView(
-                    temporaryAvatarsScroll,
-                    GUILayout.MaxHeight(maxVisibleItems * itemHeight)
-                );
+                UpdateButton();
+                repaint?.Invoke();
+            });
+            root.Add(platformField);
+
+            uploadButton = new Button(OnUploadClick) { text = "Upload This Avatar" };
+            uploadButton.tooltip = "Upload this avatar to the current target platform. " +
+                                    "If you want to upload multiple avatars, use the Continuous Avatar Uploader window.";
+            root.Add(uploadButton);
+            UpdateButton();
+
+            void OnUploadClick()
+            {
+                var uploader = OpenWindow();
+                uploader.settingsOrGroups = avatars.ToArray<AvatarUploadSettingOrGroup>();
+                if (!uploader.StartUpload())
+                    ShowUploadFailedDialog();
             }
 
-            for (int i = temporarySettings.Count - 1; i >= 0; i--)
+            void UpdateButton()
             {
-                var maySceneRef = temporarySettings[i];
-                if (maySceneRef.asset == null)
-                {
-                    temporarySettings.RemoveAt(i);
-                    continue;
-                }
-
-                var descriptor = maySceneRef.GetCachedResolve() as VRCAvatarDescriptor;
-                var avatarName = descriptor?.gameObject.name ?? "Missing Avatar";
-
-                EditorGUILayout.BeginHorizontal();
-                EditorGUI.BeginChangeCheck();
-                var newDescriptor = EditorGUILayout.ObjectField(avatarName, descriptor, typeof(VRCAvatarDescriptor), true) as VRCAvatarDescriptor;
-                if (EditorGUI.EndChangeCheck() && newDescriptor != null && newDescriptor != descriptor)
-                {
-                    temporarySettings[i] = new MaySceneReference(newDescriptor);
-                }
-
-                if (GUILayout.Button("Remove", GUILayout.Width(60)))
-                {
-                    temporarySettings.RemoveAt(i);
-                }
-                EditorGUILayout.EndHorizontal();
+                var check = CheckUploadStatic(avatars, repaint);
+                uploadButton.text = avatars.Length == 1 ? "Upload This Avatar" : $"Upload {avatars.Length} Avatars";
+                uploadButton.tooltip = check == UploadCheckResult.Ok
+                    ? "Upload this avatar to the current target platform. " +
+                      "If you want to upload multiple avatars, use the Continuous Avatar Uploader window."
+                    : "Cannot upload avatars now. Check the Continuous Avatar Uploader window for details.";
+                uploadButton.SetEnabled(check == UploadCheckResult.Ok);
             }
 
-            if (temporarySettings.Count > maxVisibleItems)
+            return root;
+        }
+    }
+
+    [Flags]
+    internal enum TargetPlatformFlags
+    {
+        Windows = 1 << (int)TargetPlatform.Windows,
+        Android = 1 << (int)TargetPlatform.Android,
+        iOS = 1 << (int)TargetPlatform.iOS,
+    }
+
+    /// <summary>
+    /// UI Toolkit equivalent of IMGUI's EnumFlagsField for upload platforms.
+    /// </summary>
+    internal sealed class EnumFlagsDropdownField : BaseField<TargetPlatformFlags>
+    {
+        private readonly TargetPlatform[] _platforms;
+        private readonly Func<TargetPlatform, bool> _getValue;
+        private readonly Action<TargetPlatform, bool> _setValue;
+        private readonly VisualElement _input;
+        private readonly Label _valueLabel;
+        private readonly TargetPlatformFlags _allFlags;
+
+        public EnumFlagsDropdownField(
+            string label,
+            TargetPlatform[] platforms,
+            Func<TargetPlatform, bool> getValue,
+            Action<TargetPlatform, bool> setValue)
+            : this(label, platforms, getValue, setValue, new VisualElement())
+        {
+        }
+
+        private EnumFlagsDropdownField(
+            string label,
+            TargetPlatform[] platforms,
+            Func<TargetPlatform, bool> getValue,
+            Action<TargetPlatform, bool> setValue,
+            VisualElement input)
+            : base(label, input)
+        {
+            _platforms = platforms;
+            _getValue = getValue;
+            _setValue = setValue;
+            _input = input;
+            _allFlags = _platforms.Aggregate((TargetPlatformFlags)0,
+                (flags, platform) => flags | FlagFor(platform));
+
+            AddToClassList("unity-base-field__aligned");
+            AddToClassList("unity-popup-field");
+            _input.AddToClassList("unity-popup-field__input");
+            _input.focusable = true;
+            _input.style.flexDirection = FlexDirection.Row;
+            _input.style.alignItems = Align.Center;
+
+            _valueLabel = new Label { name = "value" };
+            _valueLabel.pickingMode = PickingMode.Ignore;
+            _valueLabel.style.flexGrow = 1;
+            _input.Add(_valueLabel);
+
+            var arrow = new Label("▾") { name = "arrow", pickingMode = PickingMode.Ignore };
+            _input.Add(arrow);
+
+            _input.RegisterCallback<ClickEvent>(_ => ShowMenu());
+            _input.RegisterCallback<KeyDownEvent>(evt =>
             {
-                EditorGUILayout.EndScrollView();
+                if (evt.keyCode != KeyCode.Return && evt.keyCode != KeyCode.Space) return;
+                ShowMenu();
+                evt.StopPropagation();
+            });
+            RegisterCallback<AttachToPanelEvent>(_ =>
+            {
+                Preferences.UploadPlatformsChanged -= RefreshFromSource;
+                Preferences.UploadPlatformsChanged += RefreshFromSource;
+                RefreshFromSource();
+            });
+            RegisterCallback<DetachFromPanelEvent>(_ => Preferences.UploadPlatformsChanged -= RefreshFromSource);
+
+            SetValueWithoutNotify(ReadValue());
+        }
+
+        public override void SetValueWithoutNotify(TargetPlatformFlags newValue)
+        {
+            base.SetValueWithoutNotify(newValue);
+            UpdateValueLabel();
+        }
+
+        private static TargetPlatformFlags FlagFor(TargetPlatform platform) =>
+            (TargetPlatformFlags)(1 << (int)platform);
+
+        private TargetPlatformFlags ReadValue()
+        {
+            TargetPlatformFlags flags = 0;
+            foreach (var platform in _platforms)
+                if (_getValue(platform))
+                    flags |= FlagFor(platform);
+            return flags;
+        }
+
+        private void RefreshFromSource()
+        {
+            var current = ReadValue();
+            if (current != value)
+                value = current;
+        }
+
+        private void UpdateValueLabel()
+        {
+            if (value == 0)
+            {
+                _valueLabel.text = "Nothing";
+                return;
             }
 
-            if (GUILayout.Button("Clear All D&D Avatars"))
+            if (value == _allFlags)
             {
-                temporarySettings.Clear();
+                _valueLabel.text = "Everything";
+                return;
             }
+
+            _valueLabel.text = string.Join(", ", _platforms
+                .Where(platform => (value & FlagFor(platform)) != 0)
+                .Select(platform => platform.ToString()));
+        }
+
+        private void ShowMenu()
+        {
+            RefreshFromSource();
+            var menu = new GenericDropdownMenu();
+            menu.AddItem("Nothing", value == 0, () => ApplyValue(0));
+            menu.AddItem("Everything", value == _allFlags, () => ApplyValue(_allFlags));
+            menu.AddSeparator("");
+            foreach (var platform in _platforms)
+            {
+                var flag = FlagFor(platform);
+                menu.AddItem(platform.ToString(), (value & flag) != 0,
+                    () => ApplyValue(value ^ flag));
+            }
+            menu.DropDown(_input.worldBound, _input);
+        }
+
+        private void ApplyValue(TargetPlatformFlags newValue)
+        {
+            if (newValue == value) return;
+            foreach (var platform in _platforms)
+                _setValue(platform, (newValue & FlagFor(platform)) != 0);
+            value = newValue;
         }
     }
 }

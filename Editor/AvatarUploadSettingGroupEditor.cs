@@ -6,7 +6,6 @@ using UnityEditor.UIElements;
 using UnityEngine;
 using UnityEngine.UIElements;
 using VRC.SDK3.Avatars.Components;
-using Debug = System.Diagnostics.Debug;
 using Object = UnityEngine.Object;
 
 namespace Anatawa12.ContinuousAvatarUploader.Editor
@@ -18,6 +17,8 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
         private Dictionary<int, CreateDescriptorContainer> _inspectorsDoctionary = new Dictionary<int, CreateDescriptorContainer>();
         private List<CreateDescriptorContainer> _inspectors = new List<CreateDescriptorContainer>();
         private VisualElement _inspector;
+        private ObjectField _avatarToAddField;
+        private Button _addAvatarButton;
         private const int CreatePerFrame = 5;
         private const int CreateInitial = 20;
 
@@ -26,56 +27,46 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             _asset = (AvatarUploadSettingGroup)target;
 
-            var root = new VisualElement()
+            var root = new VisualElement
             {
                 name = "RootElement"
             };
-            _inspector = new VisualElement()
+            _inspector = new VisualElement
             {
                 name = "Inspectors"
             };
 
-            var header = new IMGUIContainer(() =>
+            var header = new VisualElement { name = "Header", style = { marginBottom = 6 } };
+            header.Add(new Label("Avatar Upload Settings")
             {
-                EditorGUILayout.LabelField("Avatar Upload Settings", EditorStyles.boldLabel);
-
-                var hasAvatarWithAllPlatformsDisabled = _asset.avatars.Any(avatar => !avatar.ios.enabled && !avatar.quest.enabled && !avatar.windows.enabled);
-                if (hasAvatarWithAllPlatformsDisabled)
-                    EditorGUILayout.HelpBox("Some avatars have all platforms disabled. This is fine if intentional.", MessageType.Warning);
-                
-                ContinuousAvatarUploader.UploadButtonGui(new[] { _asset }, Repaint);
-
-                EditorGUILayout.Space();
+                style = { unityFontStyleAndWeight = FontStyle.Bold }
             });
+
+            var hasAvatarWithAllPlatformsDisabled = _asset.avatars.Any(avatar => !avatar.ios.enabled && !avatar.quest.enabled && !avatar.windows.enabled);
+            if (hasAvatarWithAllPlatformsDisabled)
+            {
+                header.Add(new HelpBox("Some avatars have all platforms disabled. This is fine if intentional.",
+                    HelpBoxMessageType.Warning));
+            }
+
+            header.Add(ContinuousAvatarUploader.UploadButtonGui(new[] { _asset }, Repaint));
 
             RecreateInspectors(throttled: true);
             CreateInspectorElementsThrottled();
 
-            VRCAvatarDescriptor avatarDescriptor = null;
-            var trailer = new IMGUIContainer(() =>
+            var trailer = new VisualElement { name = "Trailer", style = { marginTop = 6 } };
+            _avatarToAddField = new ObjectField("Avatar to Add")
             {
-                avatarDescriptor = EditorGUILayout.ObjectField("Avatar to Add", avatarDescriptor,
-                    typeof(VRCAvatarDescriptor), true) as VRCAvatarDescriptor;
-
-                EditorGUI.BeginDisabledGroup(!avatarDescriptor);
-                if (GUILayout.Button("Add Avatar"))
-                {
-                    Debug.Assert(avatarDescriptor != null, nameof(avatarDescriptor) + " != null");
-                    var newObj = ScriptableObject.CreateInstance<AvatarUploadSetting>();
-                    newObj.avatarDescriptor = new MaySceneReference(avatarDescriptor);
-                    newObj.name = newObj.avatarName = avatarDescriptor.gameObject.name;
-
-                    ArrayUtility.Add(ref _asset.avatars, newObj);
-                    EditorUtility.SetDirty(_asset);
-                    AssetDatabase.AddObjectToAsset(newObj, _asset);
-                    AssetDatabase.SaveAssetIfDirty(newObj);
-                    avatarDescriptor = null;
-
-                    RecreateInspectors();
-                }
-
-                EditorGUI.EndDisabledGroup();
-            });
+                objectType = typeof(VRCAvatarDescriptor),
+                allowSceneObjects = true,
+            };
+            _avatarToAddField.AddToClassList("unity-base-field__aligned");
+            _avatarToAddField.style.marginBottom = 2;
+            _addAvatarButton = new Button(AddAvatar) { text = "Add Avatar" };
+            _addAvatarButton.SetEnabled(false);
+            _avatarToAddField.RegisterValueChangedCallback(evt => _addAvatarButton.SetEnabled(evt.newValue != null));
+            trailer.Add(_avatarToAddField);
+            trailer.Add(_addAvatarButton);
 
             root.Add(header);
             root.Add(_inspector);
@@ -84,6 +75,24 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
             UnityEngine.Debug.Log($"CreateInspectorGUI took {stopwatch.ElapsedMilliseconds}ms");
 
             return root;
+        }
+
+        private void AddAvatar()
+        {
+            var avatarDescriptor = _avatarToAddField.value as VRCAvatarDescriptor;
+            if (!avatarDescriptor) return;
+
+            var newObj = ScriptableObject.CreateInstance<AvatarUploadSetting>();
+            newObj.avatarDescriptor = new MaySceneReference(avatarDescriptor);
+            newObj.name = newObj.avatarName = avatarDescriptor.gameObject.name;
+
+            ArrayUtility.Add(ref _asset.avatars, newObj);
+            EditorUtility.SetDirty(_asset);
+            AssetDatabase.AddObjectToAsset(newObj, _asset);
+            AssetDatabase.SaveAssetIfDirty(newObj);
+            _avatarToAddField.value = null;
+
+            RecreateInspectors();
         }
 
         private void CreateInspectorElementsThrottled()
@@ -150,66 +159,121 @@ namespace Anatawa12.ContinuousAvatarUploader.Editor
         public CreateDescriptorContainer(AvatarUploadSettingGroup group, AvatarUploadSetting setting)
         {
             _setting = setting;
-            Add(new IMGUIContainer(() =>
+
+            var indexLabel = new Label();
+            void UpdateIndexLabel()
             {
                 int index = System.Array.IndexOf(group.avatars, setting);
-                EditorGUILayout.LabelField($"Avatar #{index}");
-            }));
+                indexLabel.text = index < 0 ? "Avatar" : $"Avatar #{index}";
+            }
+            UpdateIndexLabel();
+            Add(indexLabel);
+
             Add(_inspectorElementContainer = new VisualElement());
-            Add(new IMGUIContainer(() =>
+
+            var removeButton = new Button(() =>
             {
-                GUILayout.BeginHorizontal();
-                EditorGUI.BeginDisabledGroup(group.avatars[0] == setting);
-                if (GUILayout.Button("▲", EditorStyles.miniButton, GUILayout.Width(30)))
-                {
-                    var index = System.Array.IndexOf(group.avatars, setting);
-                    Debug.Assert(index != -1, nameof(index) + " != -1");
-                    var temp = group.avatars[index - 1];
-                    group.avatars[index - 1] = setting;
-                    group.avatars[index] = temp;
-                    EditorUtility.SetDirty(group);
+                ArrayUtility.Remove(ref group.avatars, setting);
+                EditorUtility.SetDirty(group);
+                Object.DestroyImmediate(setting, true);
+                AssetDatabase.SaveAssetIfDirty(group);
 
-                    OnReorder?.Invoke();
-                }
-                EditorGUI.EndDisabledGroup();
-                if (GUILayout.Button("Remove Avatar"))
-                {
-                    ArrayUtility.Remove(ref group.avatars, setting);
-                    EditorUtility.SetDirty(group);
-                    Object.DestroyImmediate(setting, true);
-                    AssetDatabase.SaveAssetIfDirty(group);
+                OnReorder?.Invoke();
+            })
+            {
+                text = "Remove Avatar",
+            };
+            removeButton.style.flexGrow = 1;
+            removeButton.style.marginTop = 2;
+            Add(removeButton);
 
-                    OnReorder?.Invoke();
-                }
-                EditorGUI.BeginDisabledGroup(group.avatars[group.avatars.Length - 1] == setting);
-                if (GUILayout.Button("▼", EditorStyles.miniButton, GUILayout.Width(30)))
+            // reorder buttons on one row: up on the left, down on the right
+            var orderRow = new VisualElement
+            {
+                style =
                 {
-                    var index = System.Array.IndexOf(group.avatars, setting);
-                    Debug.Assert(index != -1, nameof(index) + " != -1");
-                    var temp = group.avatars[index + 1];
-                    group.avatars[index + 1] = setting;
-                    group.avatars[index] = temp;
-                    EditorUtility.SetDirty(group);
-
-                    OnReorder?.Invoke();
+                    flexDirection = FlexDirection.Row,
+                    justifyContent = Justify.SpaceBetween,
+                    marginTop = 2,
+                    marginBottom = 0,
                 }
-                GUILayout.EndHorizontal();
-                HorizontalLine();
-            }));
+            };
+            var upButton = new Button(() =>
+            {
+                var index = System.Array.IndexOf(group.avatars, setting);
+                Debug.Assert(index != -1, nameof(index) + " != -1");
+                var temp = group.avatars[index - 1];
+                group.avatars[index - 1] = setting;
+                group.avatars[index] = temp;
+                EditorUtility.SetDirty(group);
+
+                OnReorder?.Invoke();
+            })
+            {
+                text = "▲",
+                tooltip = "Move up",
+            };
+            upButton.style.width = 30;
+            var downButton = new Button(() =>
+            {
+                var index = System.Array.IndexOf(group.avatars, setting);
+                Debug.Assert(index != -1, nameof(index) + " != -1");
+                var temp = group.avatars[index + 1];
+                group.avatars[index + 1] = setting;
+                group.avatars[index] = temp;
+                EditorUtility.SetDirty(group);
+
+                OnReorder?.Invoke();
+            })
+            {
+                text = "▼",
+                tooltip = "Move down",
+            };
+            downButton.style.width = 30;
+
+            void UpdateButtonsEnabled()
+            {
+                var index = System.Array.IndexOf(group.avatars, setting);
+                upButton.SetEnabled(index > 0);
+                downButton.SetEnabled(index >= 0 && index < group.avatars.Length - 1);
+            }
+
+            orderRow.Add(upButton);
+            orderRow.Add(downButton);
+            Add(orderRow);
+            var separator = new VisualElement
+            {
+                name = "separator",
+                style =
+                {
+                    height = 18,
+                    justifyContent = Justify.Center,
+                }
+            };
+            separator.Add(new VisualElement
+            {
+                style =
+                {
+                    height = 1,
+                    backgroundColor = new Color(0.5f, 0.5f, 0.5f, 1),
+                }
+            });
+            Add(separator);
+
+            OnReorder += () =>
+            {
+                UpdateIndexLabel();
+                UpdateButtonsEnabled();
+            };
+
+            UpdateButtonsEnabled();
+            RegisterCallback<AttachToPanelEvent>(_ => UpdateButtonsEnabled());
         }
 
         public void CreateInspectorElement()
         {
             if (_inspectorElementContainer.childCount != 0) return;
             _inspectorElementContainer.Add(new InspectorElement(_setting));
-        }
-
-        private static void HorizontalLine(float regionHeight = 18f, float lineHeight = 1f)
-        {
-            var rect = GUILayoutUtility.GetRect(EditorGUIUtility.fieldWidth, float.MaxValue, regionHeight, regionHeight);
-            rect.y += (rect.height - lineHeight) / 2;
-            rect.height = lineHeight;
-            EditorGUI.DrawRect(rect, new Color(0.5f, 0.5f, 0.5f, 1));
         }
     }
 }
